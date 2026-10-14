@@ -55,7 +55,9 @@ Request a graceful stop (works for both collection and timelines):
 .\.venv\Scripts\python.exe -m riot_collector request-stop
 ```
 
-Confirm shutdown in the log; `data/collector.pid` disappears after a normal exit. In the foreground, Ctrl+C also stops safely. If forcibly terminated, interrupted jobs are recovered on the next run. Resume using the same startup command and data directory. A stop request left by an earlier run is honored once; issue startup again if you intentionally stopped before the process began.
+Confirm shutdown in the log; `data/collector.pid` disappears after a normal exit. In the foreground, Ctrl+C also stops safely. Manual shutdown stops new work immediately, interrupts quota/backoff waits without sending requests, and lets in-flight HTTP responses finish and commit their complete data and rate headers. It waits up to `shutdown_grace_seconds` (default 60 seconds); wait for the PID file to disappear before starting again. A clean response does not create an extra crash-recovery cooldown. Existing quotas and Riot `Retry-After` deadlines remain in force across restarts.
+
+An unresponsive request exceeding the grace period, a forced exit, or a network failure with no response retains conservative recovery protection and pending work. Explicit `--max-seconds` and safety stops can force cancellation immediately. Resume using the same startup command and data directory. A stop request left by an earlier run is honored once; issue startup again if you intentionally stopped before the process began.
 
 Foreground and explicitly time-limited examples:
 

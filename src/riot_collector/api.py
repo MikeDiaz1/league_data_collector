@@ -86,6 +86,10 @@ class RateStateError(APIError):
     """Unknown quota history must not be silently reset."""
 
 
+class RequestStopped(APIError):
+    """A graceful stop prevented an attempt that had not been dispatched."""
+
+
 def canonical_region(route: str) -> str:
     try:
         return REGIONS[route.lower()]
@@ -354,6 +358,7 @@ class RiotClient:
         self.max_retries, self.backoff_base, self.backoff_max = max_retries, backoff_base, backoff_max
         self._locks = {region: asyncio.Lock() for region in set(REGIONS.values())}
         self._auth_failed = False
+        self._stop_event: asyncio.Event | None = None
         self.metrics: dict[str, int] = {"requests": 0, "retries": 0, "rate_limited": 0, "network_errors": 0}
         self._recent: deque[float] = deque()
 
@@ -365,6 +370,31 @@ class RiotClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+
+    def set_stop_event(self, stop: asyncio.Event) -> None:
+        self._stop_event = stop
+
+    def _check_stopping(self) -> None:
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise RequestStopped("Graceful stop: no additional Riot request dispatched")
+
+    async def _wait_before_attempt(self, seconds: float) -> None:
+        """Interrupt quota/backoff waits, without cancelling an HTTP request."""
+        self._check_stopping()
+        if self._stop_event is None:
+            await self._sleep(seconds)
+            return
+        sleeping = asyncio.create_task(self._sleep(seconds))
+        stopping = asyncio.create_task(self._stop_event.wait())
+        try:
+            await asyncio.wait((sleeping, stopping), return_when=asyncio.FIRST_COMPLETED)
+            self._check_stopping()
+            await sleeping
+        finally:
+            for task in (sleeping, stopping):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sleeping, stopping, return_exceptions=True)
 
     @property
     def requests_per_minute(self) -> float:
@@ -384,9 +414,11 @@ class RiotClient:
             response = None
             rate_delay = 0.0
             while True:
+                self._check_stopping()
                 if self._auth_failed:
                     raise AuthError("Riot API key was rejected; replace RIOT_API_KEY and resume")
                 async with self._locks[region]:
+                    self._check_stopping()
                     if self._auth_failed:
                         raise AuthError("Riot API key was rejected; replace RIOT_API_KEY and resume")
                     delay = self.limiter.delay(region, method, service)
@@ -412,7 +444,7 @@ class RiotClient:
                         break
                 # Sleep outside the regional lock so a method cooldown does not
                 # unnecessarily hold up a different endpoint in that region.
-                await self._sleep(delay)
+                await self._wait_before_attempt(delay)
             status = response.status_code if response is not None else None
             if status is not None and 200 <= status < 300:
                 return response.content
@@ -423,6 +455,10 @@ class RiotClient:
             transient = status is None or status in (408, 429) or 500 <= status < 600
             if not transient:
                 raise PermanentAPIError(status)
+            # Received responses (including 429 headers) have been persisted.
+            # Stop before any retry; an unanswered network attempt deliberately
+            # retains its pending marker and crash-recovery protection.
+            self._check_stopping()
             if attempt >= self.max_retries:
                 # A 429 cooldown was persisted even if this caller exhausts its
                 # retry budget. Every subsequent caller must still honor it.
@@ -433,5 +469,5 @@ class RiotClient:
                 # normal quota windows may conservatively require longer.
                 continue
             bound = min(self.backoff_max, self.backoff_base * (2 ** attempt))
-            await self._sleep(bound * (0.5 + 0.5 * self._jitter()))
+            await self._wait_before_attempt(bound * (0.5 + 0.5 * self._jitter()))
         raise AssertionError("unreachable")

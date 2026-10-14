@@ -21,6 +21,7 @@ class Config:
     seed_refresh_hours: float = 24.0
     rank_cache_hours: float = 168.0
     job_retry_seconds: float = 60.0
+    shutdown_grace_seconds: float = 60.0
     app_limits: tuple[tuple[int, float], ...] = ((20, 1), (100, 120))
     safety_margin: float = 0.1
     timeout_seconds: float = 30.0
@@ -68,7 +69,7 @@ def load_config(path: Path) -> Config:
             raise ValueError(f"{name} must be a positive integer (max_retries may be zero)")
     if cfg.history_page_size > 100:
         raise ValueError("Match-V5 history_page_size must be <= 100")
-    for name in ("min_free_gb", "progress_seconds", "seed_refresh_hours", "rank_cache_hours", "job_retry_seconds", "timeout_seconds"):
+    for name in ("min_free_gb", "progress_seconds", "seed_refresh_hours", "rank_cache_hours", "job_retry_seconds", "shutdown_grace_seconds", "timeout_seconds"):
         value = getattr(cfg, name)
         if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be finite and positive")

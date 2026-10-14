@@ -11,6 +11,9 @@ discovery_backlog = 2000
 seed_refresh_hours = 24.0
 rank_cache_hours = 168.0
 job_retry_seconds = 60.0
+# Manual stop / Ctrl+C lets active HTTP responses and data commits finish.
+# A timeout forces cancellation and retains conservative restart protection.
+shutdown_grace_seconds = 60.0
 
 [rate_limits]
 # Conservative caps in addition to Riot's response headers; [requests, seconds].

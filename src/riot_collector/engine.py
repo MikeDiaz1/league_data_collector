@@ -16,7 +16,7 @@ import time
 from typing import Any
 from urllib.parse import quote
 
-from .api import AuthError, NotFound, PermanentAPIError, RetryableAPIError
+from .api import AuthError, NotFound, PermanentAPIError, RequestStopped, RetryableAPIError
 from .config import ROUTING
 from .storage import LowDiskError, StorageError
 
@@ -60,6 +60,8 @@ class Collector:
         self._mode, self._smoke = mode, smoke_per_region
         self._started = time.monotonic()
         self._fatal, self._reason = None, "exhausted"
+        if hasattr(self.client, "set_stop_event"):
+            self.client.set_stop_event(stop)
         self.downloaded.clear()
         self.state.recover()
         if mode == "collect":
@@ -83,6 +85,23 @@ class Collector:
                     self._reason = "smoke-complete"
             elif self._reason == "exhausted":
                 self._reason = "interrupted"
+            if not group.done() and self._fatal is None and self._reason != "time-limit":
+                # Stop claiming work and interrupt pre-dispatch waits, but let
+                # in-flight HTTP responses update quotas and commit their data.
+                # asyncio.wait leaves the group intact if the grace period ends;
+                # the finally block then performs the forced cancellation.
+                monitor.cancel()
+                grace = self.config.shutdown_grace_seconds
+                if max_seconds is not None:
+                    grace = min(grace, max(0, max_seconds - (time.monotonic() - self._started)))
+                log.info("Graceful shutdown: allowing active requests up to %.1f seconds to finish", grace)
+                done, _ = await asyncio.wait((group,), timeout=grace)
+                if done:
+                    await group
+                    log.info("Graceful shutdown finished; all active workers have settled")
+                else:
+                    self._reason = "shutdown-timeout"
+                    log.warning("Graceful shutdown deadline reached; forcing cancellation and retaining restart protection")
         except asyncio.CancelledError:
             self._reason = "interrupted"
             stop.set()
@@ -167,6 +186,9 @@ class Collector:
             except asyncio.CancelledError:
                 self.state.retry(job["id"], "Interrupted; safe to resume", delay=0)
                 raise
+            except RequestStopped:
+                self.state.retry(job["id"], "Graceful stop before next request; safe to resume", delay=0)
+                break
             except NotFound:
                 self.state.finish(job["id"], status="skipped", error="Unavailable: Riot HTTP 404")
             except RetryableAPIError as exc:
