@@ -1,0 +1,22 @@
+[collector]
+data_dir = "data"
+platforms = ["NA1", "EUW1", "KR"]
+# A progress milestone, NEVER a stop condition.
+milestone = 100000
+min_free_gb = 10.0
+progress_seconds = 30.0
+history_page_size = 100
+# History crawls yield after each page; continuation is persistent with no page cap.
+discovery_backlog = 2000
+seed_refresh_hours = 24.0
+rank_cache_hours = 168.0
+job_retry_seconds = 60.0
+
+[rate_limits]
+# Conservative caps in addition to Riot's response headers; [requests, seconds].
+# Shared by platform + regional hosts within each regional routing group.
+application = [[20, 1], [100, 120]]
+safety_margin = 0.1
+timeout_seconds = 30.0
+max_retries = 5
+

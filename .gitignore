@@ -1,0 +1,13 @@
+data/
+.venv/
+.tools/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp*/
+*.egg-info/
+.env
+.env.*
+collector.local.toml
+
