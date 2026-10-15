@@ -1,4 +1,4 @@
-# League Data Collection
+# League Match Data Collector
 
 A resumable Python collector for League of Legends research. It uses official Riot APIs to collect **Ranked Solo/Duo (queue 420)** matches from **NA1, EUW1, and KR**.
 
