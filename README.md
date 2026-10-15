@@ -2,11 +2,11 @@
 
 A resumable Python collector for League of Legends research. It uses official Riot APIs to collect **Ranked Solo/Duo (queue 420)** matches from **NA1, EUW1, and KR**.
 
-Emerald–Challenger seeds and recursive participant discovery prioritize high ranks. Complete, original Match-V5 responses are saved as gzip JSON; SQLite tracks discovery, ranks, and global deduplication. Collection respects Riot's rate limits and resumes after interruption. **100,000 matches is a milestone, not a stop limit.**
+Emerald–Challenger seeds and recursive participant discovery prioritize high ranks. Complete, original Match-V5 responses are saved as gzip JSON; SQLite tracks discovery, ranks, and global deduplication. Collection respects Riot's rate limits, Retry-after, and resumes after interruption. **Requires your own [Riot API key](https://developer.riotgames.com/).**
 
 ## Setup
 
-Requires **Python 3.11+**, **uv**, and your own [Riot API key](https://developer.riotgames.com/). From the repository folder in PowerShell:
+Requires **Python 3.11+**, **uv**, and your own Riot API key. From the repository folder in PowerShell:
 
 ```powershell
 uv sync --locked

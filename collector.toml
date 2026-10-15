@@ -1,7 +1,7 @@
 [collector]
 data_dir = "data"
 platforms = ["NA1", "EUW1", "KR"]
-# A progress milestone, NEVER a stop condition.
+# Milestone is a progress target, NOT a stop condition.
 milestone = 100000
 min_free_gb = 10.0
 progress_seconds = 30.0
