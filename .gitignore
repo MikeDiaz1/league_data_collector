@@ -11,3 +11,31 @@ __pycache__/
 .env.*
 collector.local.toml
 
+# Local run notes and generated/private artifacts, including custom data paths.
+/cmd.txt
+/cmds.txt
+*.local.toml
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.json.gz
+*.jsonl
+*.log
+*.log.*
+rate_state.json
+collector.pid
+collector.lock
+stop.request
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Build output.
+build/
+dist/
+*.whl
+

@@ -25,8 +25,9 @@ $arguments = @('-m', 'riot_collector', '--no-console', '--config', ('"' + $confi
 if ($MaxSeconds -gt 0) { $arguments += @('--max-seconds', $MaxSeconds.ToString([Globalization.CultureInfo]::InvariantCulture)) }
 $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
 $process = Start-Process -FilePath $python -ArgumentList $arguments -WorkingDirectory $repo -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
-# Start-Process creates an independent Windows process; closing this terminal or
-# Codex does not kill it. Check the PID written after obtaining the dataset lock.
+# Start-Process hides the window, but a hosting application's Windows job may
+# still terminate its children. This is not a guarantee of independent lifetime.
+# Check the PID written after obtaining the dataset lock.
 $pidFile = Join-Path $dataDir 'collector.pid'
 for ($attempt = 0; $attempt -lt 20; $attempt++) {
     Start-Sleep -Milliseconds 500
