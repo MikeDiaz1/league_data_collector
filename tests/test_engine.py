@@ -108,7 +108,7 @@ def test_cursor_and_match_ids_roll_back_together_after_crash(components, monkeyp
     assert state.claim("history", "NA1")["payload"]["start"] == 0
 
 
-def test_raw_match_is_complete_and_recursive_discovery_transactional(components):
+def test_raw_match_is_complete_and_bounded_participant_discovery_transactional(components):
     _, state, storage = components
     raw = match_bytes()
     collector = engine(components, lambda *_: raw)
@@ -117,7 +117,8 @@ def test_raw_match_is_complete_and_recursive_discovery_transactional(components)
     assert storage.read(row["raw_path"]) == raw
     assert row["sha256"] == hashlib.sha256(raw).hexdigest()
     assert state.conn.execute("SELECT COUNT(*) FROM match_participants").fetchone()[0] == 10
-    assert state.conn.execute("SELECT COUNT(*) FROM jobs WHERE kind='history'").fetchone()[0] == 10
+    assert state.conn.execute("SELECT COUNT(*) FROM players").fetchone()[0] == 10
+    assert state.conn.execute("SELECT COUNT(*) FROM jobs WHERE kind='history'").fetchone()[0] == 0
     assert state.conn.execute("SELECT COUNT(*) FROM rank_observations").fetchone()[0] == 0
     # Replaying already-completed work must not issue a second request.
     asyncio.run(collector._match({"id": 1, "platform": "NA1", "payload": {"match_id": "NA1_1"}}))
@@ -270,8 +271,8 @@ def test_unknown_history_has_a_fair_turn_even_with_high_priority_backlog(compone
     collector = engine(components)
     state.enqueue("history", "high", "NA1", {"puuid": "high"}, 100)
     state.enqueue("history", "unknown", "NA1", {"puuid": "unknown"}, 0)
-    collector._turns["NA1"] = 4
-    assert collector._next_job("NA1")["key"] == "unknown"
+    claims = [collector._next_job("NA1"), collector._next_job("NA1")]
+    assert {job["key"] for job in claims} == {"high", "unknown"}
 
 
 def test_missing_documented_puuid_safely_retains_seed_instead_of_using_removed_api(components):
@@ -311,14 +312,13 @@ def test_monitor_failure_stops_workers_and_preserves_original_error(components, 
     assert state.conn.execute("SELECT status FROM jobs").fetchone()[0] == "pending"
 
 
-def test_oldest_match_has_a_fair_turn_amid_high_rank_matches(components):
+def test_unknown_match_has_a_fair_turn_amid_high_rank_matches(components):
     _, state, _ = components
     collector = engine(components)
     state.enqueue("match", "NA1_1", "NA1", {"match_id": "NA1_1"}, 0)
     state.enqueue("match", "NA1_2", "NA1", {"match_id": "NA1_2"}, 100)
-    collector._turns["NA1"] = 4
-    assert collector._next_job("NA1")["key"] == "NA1_1"
-    assert collector._next_job("NA1")["key"] == "NA1_2"
+    claims = [collector._next_job("NA1"), collector._next_job("NA1")]
+    assert {job["key"] for job in claims} == {"NA1_1", "NA1_2"}
 
 
 def test_disk_safety_monitor_stops_during_long_api_wait(components, monkeypatch):

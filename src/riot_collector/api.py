@@ -361,6 +361,7 @@ class RiotClient:
         self._stop_event: asyncio.Event | None = None
         self.metrics: dict[str, int] = {"requests": 0, "retries": 0, "rate_limited": 0, "network_errors": 0}
         self._recent: deque[float] = deque()
+        self.request_observer = None
 
     async def __aenter__(self) -> RiotClient:
         return self
@@ -427,6 +428,8 @@ class RiotClient:
                         self.limiter.reserve(region, method, service)
                         self.metrics["requests"] += 1
                         self._recent.append(sent_at)
+                        if self.request_observer is not None:
+                            self.request_observer(route, method, sent_at)
                         try:
                             response = await self._http.get(url, params=params)
                         except httpx.RequestError:

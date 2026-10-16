@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 import math
 import tomllib
@@ -19,6 +19,17 @@ class Config:
     history_page_size: int = 100
     discovery_backlog: int = 2000
     seed_refresh_hours: float = 24.0
+    recent_window_days: float = 14.0
+    recent_refresh_hours: float = 6.0
+    recent_seed_players_per_tier: int = 100
+    recent_participant_players_per_region: int = 100
+    recent_matches_per_player: int = 20
+    recent_tier_limits: dict[str, dict[str, int]] = field(default_factory=dict)
+    recent_uniform_fraction: float = 0.5
+    recent_sampling_weight: int = 8
+    participant_sampling_weight: int = 1
+    backfill_sampling_weight: int = 1
+    sampling_seed: int = 42
     rank_cache_hours: float = 168.0
     job_retry_seconds: float = 60.0
     shutdown_grace_seconds: float = 60.0
@@ -26,6 +37,11 @@ class Config:
     safety_margin: float = 0.1
     timeout_seconds: float = 30.0
     max_retries: int = 5
+
+    def recent_limits(self, tier: str) -> tuple[int, int]:
+        overrides = self.recent_tier_limits.get(tier, {})
+        players = self.recent_participant_players_per_region if tier == "UNKNOWN" else self.recent_seed_players_per_tier
+        return overrides.get("players", players), overrides.get("matches", self.recent_matches_per_player)
 
 
 def load_config(path: Path) -> Config:
@@ -69,7 +85,31 @@ def load_config(path: Path) -> Config:
             raise ValueError(f"{name} must be a positive integer (max_retries may be zero)")
     if cfg.history_page_size > 100:
         raise ValueError("Match-V5 history_page_size must be <= 100")
-    for name in ("min_free_gb", "progress_seconds", "seed_refresh_hours", "rank_cache_hours", "job_retry_seconds", "shutdown_grace_seconds", "timeout_seconds"):
+    for name in (
+        "recent_seed_players_per_tier", "recent_matches_per_player",
+        "recent_sampling_weight", "backfill_sampling_weight",
+    ):
+        if type(getattr(cfg, name)) is not int or getattr(cfg, name) < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    for name in ("recent_participant_players_per_region", "participant_sampling_weight", "sampling_seed"):
+        if type(getattr(cfg, name)) is not int or getattr(cfg, name) < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    if cfg.recent_matches_per_player > 100:
+        raise ValueError("Match-V5 recent_matches_per_player must be <= 100")
+    if (type(cfg.recent_uniform_fraction) not in (float, int)
+            or not math.isfinite(cfg.recent_uniform_fraction) or not 0 < cfg.recent_uniform_fraction <= 1):
+        raise ValueError("recent_uniform_fraction must be finite and in (0, 1]")
+    if not isinstance(cfg.recent_tier_limits, dict):
+        raise ValueError("recent_tier_limits must be a table of tier overrides")
+    for tier, limits in cfg.recent_tier_limits.items():
+        if tier not in {"EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"}:
+            raise ValueError(f"Unknown recent_tier_limits tier: {tier}")
+        if not isinstance(limits, dict) or set(limits) - {"players", "matches"}:
+            raise ValueError("recent_tier_limits accepts only players and matches")
+        for name, value in limits.items():
+            if type(value) is not int or value < 1 or (name == "matches" and value > 100):
+                raise ValueError(f"recent_tier_limits.{tier}.{name} must be a positive integer; matches <= 100")
+    for name in ("min_free_gb", "progress_seconds", "seed_refresh_hours", "rank_cache_hours", "job_retry_seconds", "shutdown_grace_seconds", "timeout_seconds", "recent_window_days", "recent_refresh_hours"):
         value = getattr(cfg, name)
         if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be finite and positive")

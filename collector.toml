@@ -6,14 +6,37 @@ milestone = 100000
 min_free_gb = 10.0
 progress_seconds = 30.0
 history_page_size = 100
-# History crawls yield after each page; continuation is persistent with no page cap.
+# Legacy historical backfill yields after each page and retains its saved cursor.
 discovery_backlog = 2000
 seed_refresh_hours = 24.0
+# Fixed recent windows and reproducibly rotating player cohorts.
+recent_window_days = 14.0
+recent_refresh_hours = 6.0
+# This many ladder seeds per region and tier (15 groups across the three regions).
+recent_seed_players_per_tier = 100
+recent_participant_players_per_region = 100
+recent_matches_per_player = 20
+# Half the cohort stays uniform-random; the rest rotates least-recently selected accounts.
+recent_uniform_fraction = 0.5
+# Service opportunities for recent ladder seeds, participant discovery, and backfill.
+# Duplicate matches, empty histories, and unavailable groups can change realized yield.
+recent_sampling_weight = 8
+participant_sampling_weight = 1
+backfill_sampling_weight = 1
+sampling_seed = 42
 rank_cache_hours = 168.0
 job_retry_seconds = 60.0
 # Manual stop / Ctrl+C lets active HTTP responses and data commits finish.
 # A timeout forces cancellation and retains conservative restart protection.
 shutdown_grace_seconds = 60.0
+
+[collector.recent_tier_limits.EMERALD]
+players = 200
+matches = 10
+
+[collector.recent_tier_limits.DIAMOND]
+players = 200
+matches = 10
 
 [rate_limits]
 # Conservative caps in addition to Riot's response headers; [requests, seconds].

@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Iterator
+from .diversity import record_match_diversity
 
 
 SCHEMA = """
@@ -20,6 +21,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL DEFAULT 'pending'
       CHECK(status IN ('pending','in_progress','done','failed','skipped')),
     priority INTEGER NOT NULL DEFAULT 0,
+    sampling_stream TEXT NOT NULL DEFAULT 'backfill',
+    sampling_tier TEXT NOT NULL DEFAULT 'UNKNOWN',
     attempts INTEGER NOT NULL DEFAULT 0,
     not_before REAL NOT NULL DEFAULT 0,
     error TEXT,
@@ -89,7 +92,56 @@ CREATE TABLE IF NOT EXISTS key_value (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS match_discoveries (
+    match_id TEXT NOT NULL,
+    history_job_id INTEGER NOT NULL REFERENCES jobs(id),
+    platform TEXT NOT NULL,
+    history_payload TEXT NOT NULL,
+    discovered_at REAL NOT NULL,
+    PRIMARY KEY(history_job_id, match_id)
+);
+CREATE INDEX IF NOT EXISTS discovery_match ON match_discoveries(match_id);
+CREATE TABLE IF NOT EXISTS player_sampling_history (
+    puuid TEXT NOT NULL, platform TEXT NOT NULL, last_selected_at REAL NOT NULL,
+    selection_count INTEGER NOT NULL, PRIMARY KEY(puuid,platform)
+);
+CREATE TABLE IF NOT EXISTS match_diversity (
+    match_id TEXT PRIMARY KEY REFERENCES matches(match_id), source_sha256 TEXT NOT NULL,
+    platform TEXT NOT NULL, stream TEXT NOT NULL, seed_tier TEXT NOT NULL,
+    recorded_at REAL NOT NULL, new_accounts INTEGER NOT NULL, participant_slots INTEGER NOT NULL,
+    known_role_slots INTEGER NOT NULL, new_champion_roles INTEGER NOT NULL, new_matchups INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS match_diversity_time ON match_diversity(recorded_at);
+CREATE TABLE IF NOT EXISTS gameplay_signals (
+    kind TEXT NOT NULL, signal_key TEXT NOT NULL, first_seen_at REAL NOT NULL,
+    first_match_id TEXT NOT NULL REFERENCES matches(match_id), PRIMARY KEY(kind,signal_key)
+);
+CREATE TABLE IF NOT EXISTS match_gameplay_signals (
+    match_id TEXT NOT NULL REFERENCES matches(match_id), kind TEXT NOT NULL, signal_key TEXT NOT NULL,
+    PRIMARY KEY(match_id,kind,signal_key)
+);
+CREATE TABLE IF NOT EXISTS api_request_events (
+    id INTEGER PRIMARY KEY, dispatched_at REAL NOT NULL, platform TEXT NOT NULL,
+    stream TEXT NOT NULL, seed_tier TEXT NOT NULL, kind TEXT NOT NULL, method TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS api_request_time ON api_request_events(dispatched_at);
 """
+
+
+SAMPLING_TIERS = ("EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER", "UNKNOWN")
+SAMPLING_STREAMS = ("recent", "participant", "backfill", "seed")
+
+
+def infer_sampling_tier(payload: dict[str, Any], priority: int = 0) -> str:
+    """Return the discovery seed tier, never a claim about historical lobby rank."""
+    for name in ("tier", "seed_rank", "seed_tier"):
+        value = payload.get(name)
+        if isinstance(value, dict):
+            value = value.get("tier")
+        if isinstance(value, str) and value.upper() in SAMPLING_TIERS:
+            return value.upper()
+    return {100: "CHALLENGER", 90: "GRANDMASTER", 80: "MASTER",
+            60: "DIAMOND", 40: "EMERALD"}.get(priority, "UNKNOWN")
 
 
 class State:
@@ -105,6 +157,60 @@ class State:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
         self._savepoint = 0
+        self._migrate_sampling()
+        self._migrate_diversity()
+
+    def _migrate_diversity(self) -> None:
+        with self.transaction():
+            if not self.get_meta("player_rotation_v1"):
+                for row in self.conn.execute("SELECT platform,payload,created_at FROM jobs WHERE kind='recent_history'"):
+                    payload = json.loads(row["payload"])
+                    if payload.get("puuid"):
+                        self.record_player_selection(payload["puuid"], row["platform"], row["created_at"])
+                self.set_meta("player_rotation_v1", {"initialized_at": time.time()})
+            if not self.get_meta("diversity_telemetry_v1"):
+                self.set_meta("diversity_telemetry_v1", {"started_at": time.time()})
+
+    def record_player_selection(self, puuid, platform, selected_at):
+        self.conn.execute(
+            "INSERT INTO player_sampling_history VALUES (?,?,?,1) ON CONFLICT(puuid,platform) "
+            "DO UPDATE SET last_selected_at=MAX(last_selected_at,excluded.last_selected_at), "
+            "selection_count=selection_count+1", (puuid, platform, selected_at))
+
+    def _migrate_sampling(self) -> None:
+        """Add scheduling metadata without rewriting research inputs or cursors.
+
+        The CLI holds the exclusive dataset lock before constructing State.
+        ALTER, attribution, index creation and the version marker commit together.
+        A crash rolls this migration back and the next open can retry it safely.
+        """
+        with self.transaction():
+            columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(jobs)")}
+            if "sampling_stream" not in columns:
+                self.conn.execute("ALTER TABLE jobs ADD COLUMN sampling_stream TEXT NOT NULL DEFAULT 'backfill'")
+            if "sampling_tier" not in columns:
+                self.conn.execute("ALTER TABLE jobs ADD COLUMN sampling_tier TEXT NOT NULL DEFAULT 'UNKNOWN'")
+            if not self.get_meta("sampling_schema_v1"):
+                def infer(raw: str, priority: int) -> str:
+                    try:
+                        payload = json.loads(raw)
+                    except (TypeError, ValueError):
+                        payload = {}
+                    return infer_sampling_tier(payload if isinstance(payload, dict) else {}, priority)
+
+                self.conn.create_function("infer_sampling_tier", 2, infer)
+                try:
+                    self.conn.execute(
+                        "UPDATE jobs SET sampling_tier=infer_sampling_tier(payload,priority), "
+                        "sampling_stream=CASE WHEN kind='seed' THEN 'seed' ELSE sampling_stream END"
+                    )
+                finally:
+                    self.conn.create_function("infer_sampling_tier", 2, None)
+                self.set_meta("sampling_schema_v1", {"version": 1, "migrated_at": time.time()})
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_sampling_claim ON jobs "
+                "(status,platform,sampling_stream,kind,sampling_tier,updated_at,id)"
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -135,25 +241,76 @@ class State:
         self.conn.close()
 
     def enqueue(
-        self, kind: str, key: str, platform: str, payload: dict[str, Any], priority: int = 0
+        self, kind: str, key: str, platform: str, payload: dict[str, Any], priority: int = 0,
+        *, sampling_stream: str = "backfill", sampling_tier: str | None = None,
     ) -> bool:
-        """Insert once; promote pending work without reopening completed jobs."""
+        """Insert once; promote scheduling metadata, retaining the first payload."""
+        if kind == "seed":
+            sampling_stream = "seed"
+        if sampling_stream not in SAMPLING_STREAMS:
+            raise ValueError(f"Unknown sampling stream: {sampling_stream}")
+        tier = sampling_tier if sampling_tier is not None else infer_sampling_tier(payload, priority)
+        tier = str(tier).upper()
+        if tier not in SAMPLING_TIERS:
+            tier = "UNKNOWN"
         now = time.time()
         with self.transaction():
             cursor = self.conn.execute(
                 """INSERT OR IGNORE INTO jobs
-                   (kind,key,platform,payload,priority,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (kind, key, platform.upper(), json.dumps(payload), priority, now, now),
+                   (kind,key,platform,payload,priority,sampling_stream,sampling_tier,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (kind, key, platform.upper(), json.dumps(payload), priority, sampling_stream, tier, now, now),
             )
             inserted = cursor.rowcount == 1
             if not inserted:
+                existing = self.conn.execute(
+                    "SELECT sampling_stream,sampling_tier FROM jobs WHERE kind=? AND key=? AND status='pending'",
+                    (kind, key),
+                ).fetchone()
+                promote = existing is not None and kind == "match" and (
+                    {"backfill": 0, "participant": 1, "recent": 2}.get(sampling_stream, -1)
+                    > {"backfill": 0, "participant": 1, "recent": 2}.get(existing["sampling_stream"], -1)
+                )
+                stream = sampling_stream if promote else (existing["sampling_stream"] if existing else sampling_stream)
+                if existing is not None and not promote and existing["sampling_tier"] != "UNKNOWN":
+                    tier = existing["sampling_tier"]
                 self.conn.execute(
-                    """UPDATE jobs SET priority=MAX(priority,?), updated_at=?
+                    """UPDATE jobs SET priority=MAX(priority,?),sampling_stream=?,sampling_tier=?
                        WHERE kind=? AND key=? AND status='pending'""",
-                    (priority, now, kind, key),
+                    (priority, stream, tier, kind, key),
                 )
         return inserted
+
+    def record_discovery(self, match_id: str, history_job_id: int, platform: str,
+                         payload: dict[str, Any]) -> bool:
+        """Append a discovery route, including repeats of an already stored match.
+
+        A retry of the same history job cannot overwrite its original evidence.
+        No inclusion probability or historical rank is inferred from this record.
+        """
+        with self.transaction():
+            cursor = self.conn.execute(
+                "INSERT OR IGNORE INTO match_discoveries "
+                "(match_id,history_job_id,platform,history_payload,discovered_at) VALUES (?,?,?,?,?)",
+                (match_id, history_job_id, platform.upper(), json.dumps(payload), time.time()),
+            )
+            return cursor.rowcount == 1
+
+    def sampling_summary(self) -> dict[str, Any]:
+        groups = [dict(row) for row in self.conn.execute(
+            "SELECT platform,sampling_stream AS stream,sampling_tier AS tier,kind,status,COUNT(*) AS count "
+            "FROM jobs INDEXED BY jobs_sampling_claim GROUP BY status,platform,sampling_stream,kind,sampling_tier "
+            "ORDER BY platform,sampling_stream,sampling_tier,kind,status"
+        )]
+        served = []
+        for row in self.conn.execute(
+            "SELECT key,value FROM key_value WHERE key LIKE 'sampling_scheduler:v1:%' ORDER BY key"
+        ):
+            platform = row["key"].rsplit(":", 1)[1]
+            for key, count in sorted(json.loads(row["value"]).get("served", {}).items()):
+                stream, kind, tier = key.split("|")
+                served.append({"platform": platform, "stream": stream, "kind": kind, "tier": tier, "count": count})
+        return {"version": "balanced-v1", "groups": groups, "served": served}
 
     def claim(self, kind: str | None = None, platform: str | None = None) -> dict[str, Any] | None:
         predicates = ["status='pending'", "not_before<=?"]
@@ -231,11 +388,14 @@ class State:
         stored: dict[str, Any],
         discover: bool = True,
         history_end_time: int | None = None,
+        *, queue_history: bool = True,
     ) -> bool:
         """Commit raw-file metadata, participant discovery and completion together.
 
         The caller must successfully publish and fsync the raw file first. A crash
         before this transaction leaves an orphan that can be adopted without HTTP.
+        queue_history=False keeps participant discovery without creating new
+        unbounded archival crawls; balanced cohorts can sample those players later.
         """
         metadata, info = payload["metadata"], payload["info"]
         match_id = metadata["matchId"]
@@ -270,6 +430,7 @@ class State:
                 # from a different response into this immutable raw match.
                 self.complete(job["id"])
                 return False
+            record_match_diversity(self.conn, job, payload, stored["sha256"], now)
             for participant in info["participants"]:
                 puuid = participant["puuid"]
                 self.conn.execute(
@@ -282,12 +443,13 @@ class State:
                            (puuid,platform,priority,source,discovered_at) VALUES (?,?,0,'participant',?)""",
                         (puuid, platform, now),
                     )
-                    self.enqueue(
-                        "history", f"history:{platform}:{puuid}:0", platform,
-                        {"puuid": puuid, "start": 0,
-                         "end_time": history_end_time if history_end_time is not None else int(now),
-                         "discovery_source": "participant", "seed_rank": None},
-                    )
+                    if queue_history:
+                        self.enqueue(
+                            "history", f"history:{platform}:{puuid}:0", platform,
+                            {"puuid": puuid, "start": 0,
+                             "end_time": history_end_time if history_end_time is not None else int(now),
+                             "discovery_source": "participant", "seed_rank": None},
+                        )
             self.complete(job["id"])
         return inserted
 

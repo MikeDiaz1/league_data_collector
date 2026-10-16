@@ -50,8 +50,13 @@ def parser():
     subs.add_parser("validate")
     export = subs.add_parser("export-manifest", help="Offline JSONL export with explicitly estimated rank characterization")
     export.add_argument("--output", type=Path)
+    coverage = subs.add_parser("coverage-report", help="Read-only coverage/yield report; safe while collection runs")
+    period = coverage.add_mutually_exclusive_group()
+    period.add_argument("--hours", type=float, help="Report yield over this many recent hours")
+    period.add_argument("--since", help="Inclusive ISO-8601 timestamp with timezone; default: balanced-sampling migration")
+    coverage.add_argument("--output-dir", type=Path, help="New directory inside data_dir/reports (default: timestamped)")
     subs.add_parser("request-stop", help="Request a graceful stop of the process owning this dataset")
-    ranks = subs.add_parser("refresh-ranks", help="Optional explicitly budgeted current-rank enrichment")
+    ranks = subs.add_parser("refresh-ranks", help="Optional budgeted current-rank sample of saved-match participants")
     ranks.add_argument("--limit", type=int, default=25, help="Maximum uncached players; default 25")
     return p
 
@@ -157,18 +162,33 @@ async def refresh_ranks(cfg: Config, api_key: str, limit: int):
     state = State(cfg.data_dir)
     try:
         RawStorage(cfg.data_dir, cfg.min_free_gb).check_disk()
-        cutoff = time.time() - cfg.rank_cache_hours * 3600
-        # Missing rank has lower priority than high Elo, but remains eligible.
+        now = time.time()
+        cutoff = now - cfg.rank_cache_hours * 3600
+        epoch = int(now // (cfg.rank_cache_hours * 3600))
+        # One player/platform gets one chance, regardless of rank or appearance count.
+        # Rotate reproducibly with the cache epoch; selection never sorts by tier.
+        def audit_order(platform, puuid):
+            identity = json.dumps(["rank-audit-v1", cfg.sampling_seed, epoch, platform, puuid], separators=(",", ":"))
+            return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+        state.conn.create_function("rank_audit_order", 2, audit_order, deterministic=True)
+        placeholders = ",".join("?" for _ in cfg.platforms)
         rows = list(state.conn.execute("""
-            SELECT puuid,platform FROM players
-            WHERE rank_checked_at IS NULL OR rank_checked_at<?
-            ORDER BY priority DESC,discovered_at LIMIT ?
-        """, (cutoff, limit)))
+            SELECT p.puuid,p.platform FROM players p
+            WHERE (p.rank_checked_at IS NULL OR p.rank_checked_at<?)
+              AND p.platform IN (""" + placeholders + """)
+              AND EXISTS (
+                SELECT 1 FROM match_participants mp JOIN matches m ON m.match_id=mp.match_id
+                WHERE mp.puuid=p.puuid AND m.platform=p.platform
+              )
+            ORDER BY rank_audit_order(p.platform,p.puuid),p.platform,p.puuid LIMIT ?
+        """, (cutoff, *cfg.platforms, limit)))
         async with RiotClient(
             api_key, cfg.data_dir, timeout=cfg.timeout_seconds, max_retries=cfg.max_retries,
             app_limits=cfg.app_limits, safety_margin=cfg.safety_margin,
         ) as client:
             for row in rows:
+                lookup_status = "unranked"
                 try:
                     raw = await client.get(
                         row["platform"].lower(),
@@ -180,11 +200,13 @@ async def refresh_ranks(cfg: Config, api_key: str, limit: int):
                         raise ValueError("Unexpected League-V4 rank response shape")
                 except NotFound:
                     observations = []
+                    lookup_status = "unavailable"
                 now = time.time()
                 solo = [r for r in observations if r.get("queueType") == "RANKED_SOLO_5x5"]
                 # A negative lookup is cached and invalidates stale current-rank labels.
                 if not solo:
-                    solo = [{"queueType": "RANKED_SOLO_5x5", "tier": None}]
+                    solo = [{"queueType": "RANKED_SOLO_5x5", "tier": None,
+                             "lookup_status": lookup_status}]
                 with state.transaction():
                     for rank in solo:
                         state.conn.execute("""
@@ -212,7 +234,48 @@ def main(argv=None) -> int:
             raise ValueError("--per-region must be positive")
         if args.command == "refresh-ranks" and args.limit < 1:
             raise ValueError("--limit must be positive")
-        if args.command == "status":
+        if args.command == "coverage-report":
+            from datetime import datetime
+            import math
+            import time
+            from .coverage import coverage_report
+            from .coverage_export import write_coverage_report
+            from .dataset import read_database
+
+            until = time.time()
+            if args.hours is not None:
+                if not math.isfinite(args.hours) or args.hours <= 0:
+                    raise ValueError("--hours must be finite and positive")
+                since = until - args.hours * 3600
+                basis = "explicit rolling-hours window"
+            elif args.since is not None:
+                timestamp = datetime.fromisoformat(args.since.replace("Z", "+00:00"))
+                if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                    raise ValueError("--since must include a timezone, such as Z or -07:00")
+                since = timestamp.timestamp()
+                basis = "explicit timestamp"
+            else:
+                with read_database(cfg.data_dir) as conn:
+                    row = conn.execute("SELECT value FROM key_value WHERE key='sampling_schema_v1'").fetchone()
+                    migration = json.loads(row[0]) if row else {}
+                since = migration.get("migrated_at", until - 24 * 3600)
+                basis = "balanced-sampling migration" if "migrated_at" in migration else "last 24 hours (no sampling telemetry)"
+            report = coverage_report(cfg.data_dir, since=since, until=until, platforms=cfg.platforms)
+            report["window"]["selection"] = basis
+            report["configured_budgets"] = {
+                "source": "configuration file read for this report, not guaranteed running-process configuration",
+                "weights": {"recent": cfg.recent_sampling_weight, "participant": cfg.participant_sampling_weight,
+                            "backfill": cfg.backfill_sampling_weight},
+                "platforms": list(cfg.platforms),
+                "recent_uniform_fraction": cfg.recent_uniform_fraction,
+                "recent_tier_limits": {tier: dict(zip(("players", "matches"), cfg.recent_limits(tier)))
+                                       for tier in ("EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER", "UNKNOWN")},
+            }
+            destination = write_coverage_report(report, cfg.data_dir, args.output_dir)
+            print(json.dumps({"report": str(destination / "report.html"),
+                              "json": str(destination / "report.json"),
+                              "window": report["window"], "new_matches": report["summary"]["window_matches"]}, indent=2))
+        elif args.command == "status":
             print(json.dumps(status(cfg.data_dir, cfg.min_free_gb), indent=2))
         elif args.command == "validate":
             report = validate(cfg.data_dir)

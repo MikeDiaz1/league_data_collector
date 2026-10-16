@@ -36,6 +36,12 @@ def read_database(data_dir: Path):
         conn.close()
 
 
+def _has_sampling_discoveries(conn) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='match_discoveries'"
+    ).fetchone() is not None
+
+
 def status(data_dir: Path, min_free_gb: float = 10.0) -> dict:
     data_dir = Path(data_dir)
     with read_database(data_dir) as conn:
@@ -49,6 +55,15 @@ def status(data_dir: Path, min_free_gb: float = 10.0) -> dict:
         ranks = conn.execute("SELECT count(*) FROM rank_observations").fetchone()[0]
         progress_row = conn.execute("SELECT value FROM key_value WHERE key='progress'").fetchone()
         progress = json.loads(progress_row[0]) if progress_row else None
+        sampling = dict(progress["sampling"]) if progress and progress.get("sampling") else None
+        if _has_sampling_discoveries(conn):
+            sampling = sampling or {}
+            routes = conn.execute("SELECT COUNT(*) FROM match_discoveries").fetchone()[0]
+            distinct_matches = conn.execute(
+                "SELECT COUNT(DISTINCT match_id) FROM match_discoveries"
+            ).fetchone()[0]
+            sampling.update(discovery_routes=routes, distinct_discovered_matches=distinct_matches,
+                            repeated_discovery_routes=routes - distinct_matches)
         timeline_count, timeline_bytes = conn.execute(
             "SELECT count(*),coalesce(sum(compressed_bytes),0) FROM timelines"
         ).fetchone()
@@ -67,6 +82,7 @@ def status(data_dir: Path, min_free_gb: float = 10.0) -> dict:
             max(0, int((free - min_free_gb * 1024**3) / mean)) if mean else None,
         "capacity_estimate_note": "Based on compressed match mean; additional indexes, logs and timelines reduce capacity.",
         "last_progress": progress,
+        "sampling": sampling,
         "heartbeat_age_seconds": max(0, time.time() - progress["updated_at"])
             if progress and "updated_at" in progress else None,
     }
@@ -84,6 +100,14 @@ def _ranks(conn, match_id: str, platform: str) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _sampling_discoveries(conn, match_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT history_job_id,platform,history_payload,discovered_at FROM match_discoveries "
+        "WHERE match_id=? ORDER BY discovered_at,history_job_id", (match_id,)
+    )
+    return [dict(row, history_payload=json.loads(row["history_payload"])) for row in rows]
+
+
 def export_manifest(data_dir: Path, output: Path) -> int:
     output = Path(output)
     resolved = output.resolve()
@@ -98,6 +122,7 @@ def export_manifest(data_dir: Path, output: Path) -> int:
     handle, temp = tempfile.mkstemp(prefix=output.name + ".", suffix=".tmp", dir=output.parent)
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream, read_database(data_dir) as conn:
+            has_sampling = _has_sampling_discoveries(conn)
             for row in conn.execute("SELECT * FROM matches ORDER BY match_id"):
                 item = dict(row)
                 ranks = _ranks(conn, row["match_id"], row["platform"])
@@ -105,7 +130,7 @@ def export_manifest(data_dir: Path, output: Path) -> int:
                 distribution = Counter(r["tier"] for r in known)
                 mean = sum(TIER_ORDER.index(r["tier"]) for r in known) / len(known) if known else None
                 item.update({
-                    "manifest_version": 1,
+                    "manifest_version": 2 if has_sampling else 1,
                     "date_utc": datetime.fromtimestamp(row["game_creation"] / 1000, timezone.utc).isoformat()
                         if row["game_creation"] else None,
                     "participant_rank_observations": ranks,
@@ -115,6 +140,8 @@ def export_manifest(data_dir: Path, output: Path) -> int:
                     "estimated_skill_method": "rounded mean of ordinal tier index among known current-rank observations",
                     "rank_interpretation": RANK_NOTE,
                 })
+                if has_sampling:
+                    item["sampling_discoveries"] = _sampling_discoveries(conn, row["match_id"])
                 stream.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
                 count += 1
             stream.flush()

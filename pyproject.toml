@@ -24,4 +24,6 @@ packages = ["src/riot_collector"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+cache_dir = ".tools/pytest/cache"
+addopts = ["--basetemp=.tools/pytest/tmp"]
 
